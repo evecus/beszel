@@ -17,7 +17,7 @@ on:
       create_release:
         description: "创建 GitHub Release"
         required: false
-        default: "false"
+        default: "true"
         type: boolean
 
 permissions:

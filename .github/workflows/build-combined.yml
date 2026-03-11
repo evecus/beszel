@@ -1,0 +1,262 @@
+name: Build Combined Binary
+
+# 触发条件：
+#   - 推送 tag（v* 格式）时自动创建 Release
+#   - 手动触发（可选择是否创建 Release）
+#   - 推送到 main/master 分支时仅构建，不发布
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "创建 GitHub Release"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  # ──────────────────────────────────────────────
+  # 第一步：编译前端 UI（缓存，所有平台共享）
+  # ──────────────────────────────────────────────
+  build-ui:
+    name: Build Web UI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        id: cache-node
+        with:
+          path: internal/site/node_modules
+          key: node-${{ runner.os }}-${{ hashFiles('internal/site/bun.lock', 'internal/site/package.json') }}
+
+      - name: Install dependencies
+        if: steps.cache-node.outputs.cache-hit != 'true'
+        run: bun install --cwd ./internal/site
+
+      - name: Build site
+        run: bun run --cwd ./internal/site build
+
+      - name: Upload UI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-ui-dist
+          path: internal/site/dist/
+          retention-days: 1
+
+  # ──────────────────────────────────────────────
+  # 第二步：多平台编译
+  # ──────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.tags != '' && format(' ({0})', matrix.tags) || '' }}
+    needs: build-ui
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: amd64
+            tags: glibc
+            suffix: _glibc
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: arm
+            goarm: "7"
+          - goos: linux
+            goarch: arm
+            goarm: "6"
+            suffix: _armv6
+          - goos: linux
+            goarch: riscv64
+          - goos: linux
+            goarch: mips64
+          - goos: linux
+            goarch: ppc64le
+
+          # macOS
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+
+          # Windows
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+
+          # FreeBSD
+          - goos: freebsd
+            goarch: amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "^1.22.1"
+          cache: true
+
+      - name: Download Web UI
+        uses: actions/download-artifact@v4
+        with:
+          name: web-ui-dist
+          path: internal/site/dist/
+
+      - name: Set binary name
+        id: names
+        shell: bash
+        run: |
+          ARCH="${{ matrix.goarch }}"
+          if [ -n "${{ matrix.goarm }}" ]; then
+            ARCH="armv${{ matrix.goarm }}"
+          fi
+          BINARY="beszel_${{ matrix.goos }}_${ARCH}${{ matrix.suffix }}${{ matrix.ext }}"
+          echo "binary=${BINARY}" >> "$GITHUB_OUTPUT"
+          echo "archive=beszel_${{ matrix.goos }}_${ARCH}${{ matrix.suffix }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          BUILD_TAGS=""
+          if [ "${{ matrix.tags }}" = "glibc" ]; then
+            BUILD_TAGS="-tags glibc"
+          fi
+          go build $BUILD_TAGS \
+            -ldflags "-w -s -X github.com/henrygd/beszel.Version=$(git describe --tags --always --dirty 2>/dev/null || echo 'dev')" \
+            -o "./build/${{ steps.names.outputs.binary }}" \
+            ./internal/cmd/combined
+
+      - name: Create archive
+        shell: bash
+        run: |
+          cd build
+          BINARY="${{ steps.names.outputs.binary }}"
+          ARCHIVE="${{ steps.names.outputs.archive }}"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "${ARCHIVE}.zip" "${BINARY}"
+            echo "ASSET=${ARCHIVE}.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "${ARCHIVE}.tar.gz" "${BINARY}"
+            echo "ASSET=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: beszel-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          path: build/${{ env.ASSET }}
+          retention-days: 7
+
+  # ──────────────────────────────────────────────
+  # 第三步：创建 GitHub Release（仅 tag 推送或手动选择时）
+  # ──────────────────────────────────────────────
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.create_release == 'true')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: beszel-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Get tag name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=dev-$(date +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Beszel ${{ steps.tag.outputs.name }}"
+          tag_name: ${{ steps.tag.outputs.name }}
+          prerelease: ${{ steps.tag.outputs.prerelease }}
+          generate_release_notes: true
+          files: |
+            dist/*
+          body: |
+            ## Beszel Combined Binary ${{ steps.tag.outputs.name }}
+
+            单一可执行文件，包含 hub 和 agent 功能。
+
+            ### 使用方法
+
+            ```bash
+            # 自监控模式（hub + 本地 agent）
+            ./beszel serve --http 0.0.0.0:8090
+
+            # 只运行 Hub（管理多台服务器）
+            ./beszel -hub serve --http 0.0.0.0:8090
+
+            # 只运行 Agent（被监控的服务器）
+            ./beszel -agent --key "ssh-ed25519 AAAA..." --listen :45876
+            ```
+
+            ### 下载说明
+
+            | 文件 | 平台 |
+            |------|------|
+            | `beszel_linux_amd64.tar.gz` | Linux x86_64（musl，兼容性最强） |
+            | `beszel_linux_amd64_glibc.tar.gz` | Linux x86_64（glibc，支持 Nvidia GPU 监控） |
+            | `beszel_linux_arm64.tar.gz` | Linux ARM64（树莓派 4/5 等） |
+            | `beszel_linux_armv7.tar.gz` | Linux ARMv7 |
+            | `beszel_darwin_amd64.tar.gz` | macOS Intel |
+            | `beszel_darwin_arm64.tar.gz` | macOS Apple Silicon |
+            | `beszel_windows_amd64.zip` | Windows x86_64 |
+
+            验证文件完整性：
+            ```bash
+            sha256sum -c checksums.txt
+            ```

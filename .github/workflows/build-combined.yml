@@ -73,42 +73,15 @@ jobs:
           - goos: linux
             goarch: amd64
           - goos: linux
-            goarch: amd64
-            tags: glibc
-            suffix: _glibc
-          - goos: linux
             goarch: arm64
           - goos: linux
             goarch: arm
             goarm: "7"
-          - goos: linux
-            goarch: arm
-            goarm: "6"
-            suffix: _armv6
-          - goos: linux
-            goarch: riscv64
-          - goos: linux
-            goarch: mips64
-          - goos: linux
-            goarch: ppc64le
-
           # macOS
           - goos: darwin
             goarch: amd64
           - goos: darwin
             goarch: arm64
-
-          # Windows
-          - goos: windows
-            goarch: amd64
-            ext: .exe
-          - goos: windows
-            goarch: arm64
-            ext: .exe
-
-          # FreeBSD
-          - goos: freebsd
-            goarch: amd64
 
     steps:
       - name: Checkout
